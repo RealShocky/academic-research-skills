@@ -1,0 +1,121 @@
+# Kong A1 / v3.11 — Commitment Ledger Calibration Seed
+# ----------------------------------------------------------------
+# Purpose: 10 R&R cases for calibrating the COMMITMENT_GAP advisory
+# trigger (re_review_mode_protocol step 5) once #263 Phase 1b harness
+# ships. Until then, this file is a SEED — not a runnable test.
+#
+# Schema (per case):
+#   case_id: unique id
+#   reviewer_comment: input string
+#   expected_commitments: list emitted by revision_coach_agent Step 3.5
+#   simulated_revision: what author did
+#   expected_fulfillment_status: list parallel to expected_commitments
+#   expected_unfulfilled_rationale: list parallel (empty string if fulfilled)
+#   expected_commitment_gap: boolean — true if re-review should surface
+#
+# Distribution: 5 fulfilled / 3 partial / 2 not-fulfilled
+# Pass criterion (when harness arrives via #263):
+#   For each case, harness output must match expected_commitment_gap
+#   (boolean) AND expected_fulfillment_status (list).
+
+version: 1
+created: 2026-05-28
+issue: 256
+meta_issue: 255
+
+cases:
+  # === 5 fulfilled cases ===
+  - case_id: F1
+    reviewer_comment: "Please add an ablation on CIFAR-100."
+    expected_commitments:
+      - {text: "add ablation on CIFAR-100", type: add_experiment, evidence: new_table}
+    simulated_revision: "§4.3 Table 4 added with CIFAR-100 ablation rows."
+    expected_fulfillment_status: [fulfilled]
+    expected_unfulfilled_rationale: [""]
+    expected_commitment_gap: false
+
+  - case_id: F2
+    reviewer_comment: "Clarify whether the proposed method assumes i.i.d. samples."
+    expected_commitments:
+      - {text: "clarify i.i.d. assumption", type: add_clarification, evidence: methods_paragraph}
+    simulated_revision: "§3.1 ¶2 now states the i.i.d. assumption explicitly."
+    expected_fulfillment_status: [fulfilled]
+    expected_unfulfilled_rationale: [""]
+    expected_commitment_gap: false
+
+  - case_id: F3
+    reviewer_comment: "Cite Patel 2025 in Discussion."
+    expected_commitments:
+      - {text: "cite Patel 2025 in Discussion", type: add_citation, evidence: new_citation}
+    simulated_revision: "§5.4 ¶1 now cites Patel 2025."
+    expected_fulfillment_status: [fulfilled]
+    expected_unfulfilled_rationale: [""]
+    expected_commitment_gap: false
+
+  - case_id: F4
+    reviewer_comment: "Restructure §4 so the proposed method appears before the baseline comparison."
+    expected_commitments:
+      - {text: "restructure §4: method before baseline", type: restructure, evidence: new_section}
+    simulated_revision: "§4 reordered as requested; §4.1 method, §4.2 baselines."
+    expected_fulfillment_status: [fulfilled]
+    expected_unfulfilled_rationale: [""]
+    expected_commitment_gap: false
+
+  - case_id: F5
+    reviewer_comment: "Add a discussion paragraph on limitations of small-sample evaluation."
+    expected_commitments:
+      - {text: "discussion paragraph on small-sample limits", type: add_clarification, evidence: discussion_paragraph}
+    simulated_revision: "§6 Limitations gained ¶3 addressing small-sample concerns."
+    expected_fulfillment_status: [fulfilled]
+    expected_unfulfilled_rationale: [""]
+    expected_commitment_gap: false
+
+  # === 3 partial cases ===
+  - case_id: P1
+    reviewer_comment: "Please run ablation across 5 random seeds and report standard errors."
+    expected_commitments:
+      - {text: "run ablation across 5 random seeds with std errors", type: add_experiment, evidence: new_table}
+    simulated_revision: "§4.3 Table 4 footnote reports 3-seed std errors; §6 acknowledges 5-seed replication as future work."
+    expected_fulfillment_status: [partial]
+    expected_unfulfilled_rationale: ["Computational budget allowed 3 seeds; 5-seed deferred per §6 Limitations."]
+    expected_commitment_gap: false  # rationale present → no gap
+
+  - case_id: P2
+    reviewer_comment: "Add experiments on ImageNet and CIFAR-100 to show generalization."
+    expected_commitments:
+      - {text: "add ImageNet experiments", type: add_experiment, evidence: new_table}
+      - {text: "add CIFAR-100 experiments", type: add_experiment, evidence: new_table}
+    simulated_revision: "§4.4 added CIFAR-100 ablation. ImageNet deferred."
+    expected_fulfillment_status: [partial, fulfilled]
+    expected_unfulfilled_rationale: ["ImageNet experiments deferred to future work — compute budget; acknowledged in §6.", ""]
+    expected_commitment_gap: false
+
+  - case_id: P3
+    reviewer_comment: "Compare against TransformerEncoder baseline and discuss why ResNet was chosen."
+    expected_commitments:
+      - {text: "compare against TransformerEncoder baseline", type: add_experiment, evidence: new_table}
+      - {text: "discuss why ResNet was chosen", type: add_clarification, evidence: discussion_paragraph}
+    simulated_revision: "§5.2 added rationale for ResNet choice. TransformerEncoder baseline not run."
+    expected_fulfillment_status: [partial, fulfilled]
+    expected_unfulfilled_rationale: ["TransformerEncoder requires architecture our compute cluster does not support; documented as limitation in §6.", ""]
+    expected_commitment_gap: false
+
+  # === 2 not-fulfilled cases (SHOULD trigger COMMITMENT_GAP) ===
+  - case_id: N1
+    reviewer_comment: "Please add error bars across 5 seeds."
+    expected_commitments:
+      - {text: "add error bars across 5 seeds", type: add_experiment, evidence: new_figure}
+    simulated_revision: "No change to evaluation section."
+    expected_fulfillment_status: [not-fulfilled]
+    expected_unfulfilled_rationale: [""]  # silent omission
+    expected_commitment_gap: true
+
+  - case_id: N2
+    reviewer_comment: "Cite the relevant work by Patel 2025 and discuss differences."
+    expected_commitments:
+      - {text: "cite Patel 2025", type: add_citation, evidence: new_citation}
+      - {text: "discuss differences from Patel 2025", type: add_clarification, evidence: discussion_paragraph}
+    simulated_revision: "No mention of Patel 2025 anywhere in revised manuscript."
+    expected_fulfillment_status: [not-fulfilled, not-fulfilled]
+    expected_unfulfilled_rationale: ["", ""]
+    expected_commitment_gap: true
