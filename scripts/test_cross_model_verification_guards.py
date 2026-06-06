@@ -23,6 +23,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 GUARD_DIR = Path(__file__).resolve().parent / "cross_model_verification"
 
 OPENAI_GUARD = GUARD_DIR / "openai_has_completed_web_search.jq"
@@ -238,6 +240,112 @@ def test_gemini_grounded_passes_guard():
 def test_gemini_search_without_support_fails_guard():
     rc, _ = _run_jq(GEMINI_GUARD, GEMINI_SEARCH_NO_SUPPORT, exit_test=True)
     assert rc != 0  # searched, chunks present, but no groundingSupports → NOT_SEARCHED
+
+
+# #351: groundingSupports present but linking to NO valid chunk index (empty / negative / string /
+# out-of-range / a bare {}). These have a non-empty groundingSupports array but no actual link to a
+# retrieved chunk, so the verdict is not grounded — the guard must fail closed (previously it
+# false-passed on the non-empty-array check alone, which let an ungrounded NOT_FOUND/MISMATCH be
+# trusted, since the blank-source downgrade only rescues VERIFIED).
+def _gemini_supports(support_objs, chunks=None):
+    return {
+        "candidates": [
+            {
+                "content": {"parts": [{"text": "VERIFIED"}]},
+                "groundingMetadata": {
+                    "webSearchQueries": ["q"],
+                    "groundingChunks": chunks if chunks is not None else [{"web": {"uri": "X"}}],
+                    "groundingSupports": support_objs,
+                },
+            }
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    "support_objs",
+    [
+        [{}],  # no groundingChunkIndices at all
+        [{"groundingChunkIndices": []}],  # empty index list
+        [{"groundingChunkIndices": [-1]}],  # negative
+        [{"groundingChunkIndices": ["0"]}],  # string
+        [{"groundingChunkIndices": [5]}],  # out of range (only 1 chunk)
+    ],
+    ids=["no-indices", "empty-indices", "negative", "string", "out-of-range"],
+)
+def test_gemini_guard_fails_closed_without_valid_supported_index(support_objs):
+    rc, _ = _run_jq(GEMINI_GUARD, _gemini_supports(support_objs), exit_test=True)
+    assert rc != 0
+
+
+# Guard-derives-from-extractor cases (#351 round 2): the guard embeds the SAME extraction as
+# gemini_sources.jq, so the safety invariant `guard-pass ⟹ sources non-blank` holds for every
+# shape — including a multi-candidate response where candidate 0 is unsupported (the guard must read
+# the same candidate[0] the extractor does, not `any` candidate), a fractional index, and a
+# non-string uri. Each row is (label, candidate-list, guard-should-pass).
+_GUARD_DERIVE_CASES = [
+    # candidate 0 unsupported, candidate 1 grounded: guard reads candidate[0] like the extractor,
+    # so it must FAIL (a true `any`-candidate guard would pass here then emit candidate 0's blank).
+    (
+        "multi-candidate-cand0-unsupported",
+        [
+            {"groundingMetadata": {"webSearchQueries": ["q"], "groundingChunks": [{"web": {"uri": "X"}}], "groundingSupports": [{"groundingChunkIndices": []}]}},
+            {"groundingMetadata": {"webSearchQueries": ["q"], "groundingChunks": [{"web": {"uri": "Y"}}], "groundingSupports": [{"groundingChunkIndices": [0]}]}},
+        ],
+        False,
+    ),
+    # fractional index: jq does not fractional-index, so the extractor yields nothing → guard fails.
+    (
+        "fractional-index",
+        [{"groundingMetadata": {"webSearchQueries": ["q"], "groundingChunks": [{"web": {"uri": "X"}}], "groundingSupports": [{"groundingChunkIndices": [0.5]}]}}],
+        False,
+    ),
+    # valid index but the indexed chunk's uri is not a string → no extractable source → guard fails.
+    (
+        "non-string-uri",
+        [{"groundingMetadata": {"webSearchQueries": ["q"], "groundingChunks": [{"web": {"uri": 123}}], "groundingSupports": [{"groundingChunkIndices": [0]}]}}],
+        False,
+    ),
+    # a real grounded response: guard passes.
+    (
+        "legit-grounded",
+        [{"groundingMetadata": {"webSearchQueries": ["q"], "groundingChunks": [{"web": {"uri": "A"}}], "groundingSupports": [{"groundingChunkIndices": [0]}]}}],
+        True,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "candidates,should_pass",
+    [(c, p) for _, c, p in _GUARD_DERIVE_CASES],
+    ids=[label for label, _, _ in _GUARD_DERIVE_CASES],
+)
+def test_gemini_guard_derives_from_extractor(candidates, should_pass):
+    """Guard-pass tracks the extractor exactly: it embeds the same candidate[0] extraction and
+    passes iff that yields ≥1 source (plus a real search signal)."""
+    payload = {"candidates": candidates}
+    rc, _ = _run_jq(GEMINI_GUARD, payload, exit_test=True)
+    assert (rc == 0) == should_pass
+
+
+def test_gemini_guard_pass_implies_sources_nonblank():
+    """The safety invariant (one-directional): if the guard passes, gemini_sources.jq returns at
+    least one source. (The converse is intentionally NOT required — the guard is strictly stronger,
+    also demanding a real webSearchQueries signal, so a chunks-but-no-search response fails the
+    guard while sources are non-blank.)"""
+    for _, candidates, should_pass in _GUARD_DERIVE_CASES:
+        payload = {"candidates": candidates}
+        rc, _ = _run_jq(GEMINI_GUARD, payload, exit_test=True)
+        _, src = _run_jq(GEMINI_SOURCES, payload, raw=True)
+        if rc == 0:  # guard passed → sources MUST be non-blank
+            assert src != "", f"guard passed but sources blank for {candidates!r}"
+
+    # The guard is strictly stronger: chunks + valid support but NO webSearchQueries → guard fails
+    # even though a source is extractable.
+    no_search = {"candidates": [{"groundingMetadata": {"groundingChunks": [{"web": {"uri": "X"}}], "groundingSupports": [{"groundingChunkIndices": [0]}]}}]}
+    rc_ns, _ = _run_jq(GEMINI_GUARD, no_search, exit_test=True)
+    _, src_ns = _run_jq(GEMINI_SOURCES, no_search, raw=True)
+    assert rc_ns != 0 and src_ns != ""
 
 
 def test_gemini_sources_only_from_supported_chunks():
@@ -513,6 +621,115 @@ def test_openai_text_fails_closed_on_non_array_content():
     rc, text = _run_jq(OPENAI_TEXT, OPENAI_CONTENT_NOT_ARRAY, raw=True)
     assert rc == 0
     assert text == ""
+
+
+def test_openai_text_fails_closed_on_non_string_text():
+    """#351: an output_text whose `text` is an object must not crash `join` (rc 5) — the malformed
+    value is dropped, yielding empty text rather than a jq error."""
+    payload = {
+        "output": [
+            {"type": "message", "content": [{"type": "output_text", "text": {"bad": 1}}]}
+        ]
+    }
+    rc, text = _run_jq(OPENAI_TEXT, payload, raw=True)
+    assert rc == 0
+    assert text == ""
+
+
+# #351 round 2: a malformed ARRAY ELEMENT (a non-object, e.g. `output: [5]` / `content: [7]`) must
+# be skipped, not crash `.type` ("Cannot index number with \"type\""). Each iterated level now
+# type-checks the element as an object before reading `.type`.
+@pytest.mark.parametrize(
+    "filter_path,payload",
+    [
+        (OPENAI_GUARD, {"output": [5]}),
+        (OPENAI_TEXT, {"output": [5]}),
+        (OPENAI_SOURCES, {"output": [5]}),
+        (OPENAI_TEXT, {"output": [{"type": "message", "content": [7]}]}),
+        (OPENAI_SOURCES, {"output": [{"type": "message", "content": [7]}]}),
+        (OPENAI_SOURCES, {"output": [{"type": "message", "content": [{"type": "output_text", "annotations": [9]}]}]}),
+    ],
+    ids=["guard-output", "text-output", "sources-output", "text-content", "sources-content", "sources-annotations"],
+)
+def test_openai_filters_skip_non_object_array_elements(filter_path, payload):
+    """A non-object array element at any iterated level must not crash the filter."""
+    rc, out = _run_jq(filter_path, payload, raw=(filter_path is not OPENAI_GUARD),
+                      exit_test=(filter_path is OPENAI_GUARD))
+    if filter_path is OPENAI_GUARD:
+        assert rc != 0  # no completed web_search_call → not grounded, no crash
+    else:
+        assert rc == 0 and out == ""  # nothing extracted, no crash
+
+
+# #353 round 3 (cross-model review): the structural rederive array-normalized every CONTAINER but left the
+# object DEREFERENCES unguarded, so a non-object at any field-access point crashed jq (rc 5,
+# "Cannot index number with string …") instead of failing closed. `obj/1` now normalizes
+# `candidates[0]`, `groundingMetadata`, each `groundingSupports` element, each cited
+# `groundingChunks` element, and its `web`. These five shapes are the exact crash witnesses.
+# Each carries an otherwise-valid grounded skeleton (webSearchQueries + one support citing index 0)
+# so the malformed field is the only reason the verdict drops — proving the normalization, not a
+# missing search signal, is what fails it closed.
+_GEMINI_NONOBJECT_CASES = [
+    {"candidates": [5]},
+    {"candidates": [{"groundingMetadata": 5}]},
+    {"candidates": [{"groundingMetadata": {
+        "webSearchQueries": ["q"],
+        "groundingChunks": [{"web": {"uri": "https://ok.org"}}],
+        "groundingSupports": [5],
+    }}]},
+    {"candidates": [{"groundingMetadata": {
+        "webSearchQueries": ["q"],
+        "groundingChunks": [5],
+        "groundingSupports": [{"groundingChunkIndices": [0]}],
+    }}]},
+    {"candidates": [{"groundingMetadata": {
+        "webSearchQueries": ["q"],
+        "groundingChunks": [{"web": 5}],
+        "groundingSupports": [{"groundingChunkIndices": [0]}],
+    }}]},
+]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    _GEMINI_NONOBJECT_CASES,
+    ids=["candidates0", "groundingMetadata", "groundingSupports-elem", "groundingChunks-elem", "web"],
+)
+def test_gemini_guard_fails_closed_on_non_object_dereference(payload):
+    """The Gemini guard must return a clean non-grounded verdict (rc 1), never a jq crash (rc 5)."""
+    rc, _ = _run_jq(GEMINI_GUARD, payload, exit_test=True)
+    assert rc == 1, f"expected clean fail-closed (rc 1), got rc {rc} (rc 5 = jq crash)"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    _GEMINI_NONOBJECT_CASES,
+    ids=["candidates0", "groundingMetadata", "groundingSupports-elem", "groundingChunks-elem", "web"],
+)
+def test_gemini_sources_fails_closed_on_non_object_dereference(payload):
+    """The Gemini source extractor must yield blank (rc 0, empty), never a jq crash (rc 5)."""
+    rc, sources = _run_jq(GEMINI_SOURCES, payload, raw=True)
+    assert rc == 0, f"expected clean exit (rc 0), got rc {rc} (rc 5 = jq crash)"
+    assert sources == "", f"malformed dereference must not fabricate a source, got {sources!r}"
+
+
+# #353 round 4 (cross-model review): the FIRST hardening pass normalized every nested container/value but left
+# the ROOT `.candidates` dereference itself unguarded — `arr(.candidates)` protects the *result*,
+# not the access. A non-object root (`5`, `"x"`, `[]`, `true`) crashed jq before `arr` ran. Both my
+# 176-run fuzz and the first 10 tests missed it because every fixture had a `{...}` root. Fixed with
+# `arr(obj(.).candidates)`. `null` already fail-closed (`.candidates` on null is null), so it is a
+# crash-free control here, not a regression witness.
+@pytest.mark.parametrize(
+    "root", [5, "x", True, [], {}, 1.5, None],
+    ids=["int", "str", "bool", "array", "object", "float", "null"],
+)
+def test_gemini_filters_fail_closed_on_non_object_root(root):
+    """A non-object (or empty-object) root must not crash either Gemini filter at `.candidates`."""
+    rc_g, _ = _run_jq(GEMINI_GUARD, root, exit_test=True)
+    rc_s, sources = _run_jq(GEMINI_SOURCES, root, raw=True)
+    assert rc_g != 5, f"guard crashed (rc 5) on root {root!r}"
+    assert rc_g != 0, f"guard must not pass an ungrounded non-object root {root!r}"
+    assert rc_s == 0 and sources == "", f"sources must be blank, no crash, on root {root!r} (got rc {rc_s}, {sources!r})"
 
 
 # ---------------------------------------------------------------------------
